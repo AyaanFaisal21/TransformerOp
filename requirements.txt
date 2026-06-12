@@ -1,0 +1,4 @@
+# torch is installed separately with the cu126 index (see README Setup)
+numpy
+matplotlib
+requests

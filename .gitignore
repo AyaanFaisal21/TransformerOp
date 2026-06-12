@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Data and artifacts
+data/*.txt
+data/*.bin
+checkpoints/
+runs/
+
+# Profiler output
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.json.gz
+
+# Build output (Phase 3 extensions)
+build/
+*.pyd
+*.lib
+*.exp
+
+# Editor/OS
+.vscode/
+.idea/
+Thumbs.db
