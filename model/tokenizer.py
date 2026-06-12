@@ -11,20 +11,16 @@ Invariant to test: decode(encode(s)) == s for any s drawn from the corpus.
 
 class CharTokenizer:
     def __init__(self, text: str):
-        # TODO(you): build the vocabulary from `text`.
-        #   - chars: sorted list of unique characters in text
-        #   - self.stoi: dict mapping char -> int id
-        #   - self.itos: dict mapping int id -> char
-        #   - self.vocab_size
-        raise NotImplementedError
+        chars = sorted(set(text))
+        self.stoi = {ch: i for i, ch in enumerate(chars)}
+        self.itos = {i: ch for i, ch in enumerate(chars)}
+        self.vocab_size = len(chars)
 
     def encode(self, s: str) -> list[int]:
-        # TODO(you): string -> list of int ids
-        raise NotImplementedError
+        return [self.stoi[ch] for ch in s]
 
     def decode(self, ids: list[int]) -> str:
-        # TODO(you): list of int ids -> string
-        raise NotImplementedError
+        return "".join(self.itos[i] for i in ids)
 
 
 if __name__ == "__main__":
