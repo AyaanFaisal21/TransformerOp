@@ -30,27 +30,30 @@ class Head(nn.Module):
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        # TODO(you):
-        #   - key, query, value: nn.Linear(n_embd, head_size, bias=False)
-        #     where head_size = n_embd // n_head
-        #   - causal mask: self.register_buffer("tril",
-        #         torch.tril(torch.ones(block_size, block_size)))
-        #   - dropout on the attention weights
-        raise NotImplementedError
+        head_size = cfg.n_embd // cfg.n_head
+        self.key = nn.Linear(cfg.n_embd, head_size, bias=False)
+        self.query = nn.Linear(cfg.n_embd, head_size, bias=False)
+        self.value = nn.Linear(cfg.n_embd, head_size, bias=False)
+        # tril is fixed, not learned -> register_buffer (moves to GPU with the
+        # model, but the optimizer never touches it).
+        self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)))
+        self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, C) -> out: (B, T, hs)
-        # TODO(you):
-        #   k, q, v = projections of x                      (B, T, hs)
-        #   wei = q @ k.transpose(-2, -1) * hs**-0.5        (B, T, T)
-        #   wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        #   wei = softmax(wei, dim=-1); dropout
-        #   out = wei @ v                                   (B, T, hs)
-        #
-        # Why the 1/sqrt(hs) scale: without it the variance of q.k grows with
-        # hs, softmax saturates to one-hot, and gradients die. Try removing it
-        # once and watch the loss curve -- that's a README-worthy ablation.
-        raise NotImplementedError
+        B, T, C = x.shape
+        k = self.key(x)    # (B, T, hs)
+        q = self.query(x)  # (B, T, hs)
+        v = self.value(x)  # (B, T, hs)
+
+        # the all-pairs score grid, in one matmul; scale keeps softmax sane
+        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5     # (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # blank the future
+        wei = F.softmax(wei, dim=-1)                            # each row sums to 1
+        wei = self.dropout(wei)
+
+        out = wei @ v                                           # (B, T, hs)
+        return out
 
 
 class MultiHeadAttention(nn.Module):
