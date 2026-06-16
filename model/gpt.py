@@ -61,13 +61,15 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        # TODO(you): nn.ModuleList of Heads, output projection
-        # nn.Linear(n_embd, n_embd), dropout.
-        raise NotImplementedError
+        self.heads = nn.ModuleList([Head(cfg) for _ in range(cfg.n_head)])
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)  # mixes the per-head outputs
+        self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(you): concat head outputs on the channel dim, project, dropout.
-        raise NotImplementedError
+        # each head -> (B, T, hs); concat on channels -> (B, T, n_head*hs == n_embd)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
 
 
 class FeedForward(nn.Module):
@@ -75,11 +77,15 @@ class FeedForward(nn.Module):
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        # TODO(you)
-        raise NotImplementedError
+        self.net = nn.Sequential(
+            nn.Linear(cfg.n_embd, 4 * cfg.n_embd),  # widen
+            nn.GELU(),                               # the nonlinearity that makes depth count
+            nn.Linear(4 * cfg.n_embd, cfg.n_embd),  # project back
+            nn.Dropout(cfg.dropout),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        return self.net(x)
 
 
 class Block(nn.Module):
@@ -92,33 +98,49 @@ class Block(nn.Module):
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        # TODO(you): ln1, ln2 (nn.LayerNorm), MultiHeadAttention, FeedForward
-        raise NotImplementedError
+        self.ln1 = nn.LayerNorm(cfg.n_embd)
+        self.ln2 = nn.LayerNorm(cfg.n_embd)
+        self.attn = MultiHeadAttention(cfg)
+        self.ffwd = FeedForward(cfg)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        # the `x +` is the residual: each sub-layer proposes an *edit* to x
+        x = x + self.attn(self.ln1(x))   # communicate across positions
+        x = x + self.ffwd(self.ln2(x))   # then compute per position
+        return x
 
 
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
-        # TODO(you):
-        #   - token embedding: nn.Embedding(vocab_size, n_embd)
-        #   - position embedding: nn.Embedding(block_size, n_embd)
-        #   - nn.Sequential of n_layer Blocks
-        #   - final LayerNorm, then lm_head: nn.Linear(n_embd, vocab_size)
-        raise NotImplementedError
+        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+        self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.blocks = nn.Sequential(*[Block(cfg) for _ in range(cfg.n_layer)])
+        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        # TODO(you):
-        #   tok_emb (B, T, C) + pos_emb (T, C) -> blocks -> ln -> lm_head
-        #   loss: same cross-entropy reshape as the bigram model.
-        raise NotImplementedError
+        B, T = idx.shape
+        tok = self.token_emb(idx)                                  # (B, T, C)
+        pos = self.pos_emb(torch.arange(T, device=idx.device))     # (T, C), broadcast over B
+        x = tok + pos
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)                                   # (B, T, vocab_size)
+        if targets is None:
+            return logits, None
+        B, T, C = logits.shape
+        loss = F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
+        return logits, loss
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
-        # TODO(you): same loop as BigramLM.generate, but crop the context to
-        # the last block_size tokens before each forward pass (the position
-        # embedding table has no rows past block_size).
-        raise NotImplementedError
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.cfg.block_size:]   # crop: pos_emb has no rows past block_size
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, next_id), dim=1)
+        return idx
