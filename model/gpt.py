@@ -89,7 +89,7 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    """Transformer block: pre-norm residual attention + MLP.
+    """Transformer block: pre-norm residual attention ++ MLP.
 
     x = x + attn(ln1(x)); x = x + ffwd(ln2(x))
     Pre-norm (LayerNorm *inside* the residual branch) is what lets deep stacks
