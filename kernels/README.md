@@ -1,4 +1,4 @@
-# Kernels (Phase 3)
+# Kernels (Cuda Portion - Phase 3)
 
 Custom CUDA kernels, compiled as PyTorch C++ extensions (`torch.utils.cpp_extension`), each replacing a hot path identified in `benchmarks/profile.md`.
 
