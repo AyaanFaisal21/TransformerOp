@@ -38,3 +38,25 @@ loop — that number was deflated because the loop's timer included the periodic
 4. **matmul** is already at ~50% of peak via cuBLAS. Beating cuBLAS is very hard; the
    matmul kernel ladder (naive → tiled → vectorized) is a *learning* exercise that
    climbs toward it, not a realistic win. Be honest about this in results.
+
+## Optimization log
+
+### 1. Batched attention heads (PyTorch-level, pre-CUDA)
+
+Replaced the Python loop over 6 separate `Head` modules with one fused QKV matmul +
+batched attention over the head dimension. Same math, far fewer/larger ops.
+
+| metric | before (loop) | after (batched) | change |
+|---|---|---|---|
+| forward | 118.5 ms | 108.8 ms | 1.09× |
+| train step | 361.8 ms | 323.7 ms | 1.12× |
+| generate | 54 tok/s | 252 tok/s | **4.7×** |
+
+Generation gains the most: it runs many forwards on tiny tensors where kernel-launch
+overhead dominates, and batching collapsed the per-step launch count. Consequence:
+the parameter layout changed (one `qkv` Linear vs separate per-head Linears), so the
+old `gpt.pt` checkpoint no longer loads — retrain before sampling.
+
+(The op-level micro-benchmarks don't use the model, so their run-to-run drift — e.g.
+matmul 5.28→3.92 ms — is GPU clock/thermal variance, not this change. Only the
+model-level rows reflect the refactor.)

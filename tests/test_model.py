@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from model.bigram import BigramLM
-from model.gpt import GPT, GPTConfig, Head
+from model.gpt import GPT, GPTConfig, Head, MultiHeadAttention
 from model.tokenizer import CharTokenizer
 
 CFG = GPTConfig(vocab_size=65, block_size=64, n_layer=2, n_head=4, n_embd=128)
@@ -76,6 +76,19 @@ def test_causal_mask_no_future_leak():
     wei = torch.softmax(wei, dim=-1)[0]
     assert torch.all(torch.triu(wei, diagonal=1) == 0), "attention leaked into the future"
     assert torch.allclose(wei.sum(-1), torch.ones(10)), "rows must sum to 1"
+
+
+def test_batched_attention_is_causal():
+    # black-box causality: perturbing the LAST position must not change any earlier
+    # position's output (it can't attend to the future). Guards the batched refactor.
+    torch.manual_seed(0)
+    mha = MultiHeadAttention(CFG).eval()  # eval() disables dropout
+    x = torch.randn(1, 8, CFG.n_embd)
+    out1 = mha(x)
+    x2 = x.clone()
+    x2[:, -1, :] += 10.0
+    out2 = mha(x2)
+    assert torch.allclose(out1[:, :-1, :], out2[:, :-1, :], atol=1e-5)
 
 
 def test_generate_shape_and_token_range():

@@ -26,7 +26,12 @@ class GPTConfig:
 
 
 class Head(nn.Module):
-    """One head of causal self-attention."""
+    """One head of causal self-attention -- the readable, single-head reference.
+
+    The model uses the batched `MultiHeadAttention` below (all heads in a few large
+    ops). This class stays as the 1:1-with-the-math version and is exercised by
+    tests/test_model.py.
+    """
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -61,14 +66,31 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.heads = nn.ModuleList([Head(cfg) for _ in range(cfg.n_head)])
-        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)  # mixes the per-head outputs
-        self.dropout = nn.Dropout(cfg.dropout)
+        assert cfg.n_embd % cfg.n_head == 0
+        self.n_head = cfg.n_head
+        self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)  # Q, K, V in one matmul
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
+        self.attn_dropout = nn.Dropout(cfg.dropout)
+        self.resid_dropout = nn.Dropout(cfg.dropout)
+        self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # each head -> (B, T, hs); concat on channels -> (B, T, n_head*hs == n_embd)
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
+        B, T, C = x.shape
+        hs = C // self.n_head
+        q, k, v = self.qkv(x).split(C, dim=-1)                # each (B, T, C), one matmul
+        # split channels into heads, move the head dim next to batch -> (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2)
+        k = k.view(B, T, self.n_head, hs).transpose(1, 2)
+        v = v.view(B, T, self.n_head, hs).transpose(1, 2)
+
+        wei = (q @ k.transpose(-2, -1)) * hs ** -0.5          # (B, nh, T, T), all heads at once
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.attn_dropout(wei)
+        out = wei @ v                                         # (B, nh, T, hs)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, C)  # reassemble heads -> (B, T, C)
+        out = self.resid_dropout(self.proj(out))
         return out
 
 
