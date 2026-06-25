@@ -41,9 +41,26 @@ kernel do what calling separate torch ops cannot.
 FlashAttention online-softmax recurrence (running max + running sum + rescaled
 accumulator). Shape B=64, nh=6, T=256, hs=64. Correctness vs `F.scaled_dot_product_attention`.
 
-| version | design | correctness | time | vs SDPA | vs naive |
-|---|---|---|---|---|---|
-| v1 | one thread per query row | allclose, max_err 8.3e-7 | 7.78 ms | 0.14× | 0.44× |
+Reference bars: SDPA (torch FlashAttention) ~1.1 ms, naive materialized (cuBLAS bmm) ~4.6 ms.
+All versions correct (max_err ~1e-6 vs SDPA).
+
+| version | design | time | vs v1 | bottleneck found |
+|---|---|---|---|---|
+| **v1** | one thread per query row | **7.78 ms** | — | acc[64] spills to local mem; but ~100% occupancy |
+| v2 | warp/row, dims split across lanes | 8.96 ms | 0.87× | warp reduction *per key* (dot too small to split) |
+| v3 | warp/row, lane=key, 1 warp/block | 30.4 ms | 0.26× | ~6% occupancy (16 KB shared starves the SM) |
+| v4 | v3 + 8 queries/block sharing K/V tile | 11.3 ms | 0.69× | 32-way shared-memory bank conflict in the dot |
+| v5 | v4 + K stored transposed (conflict-free) | 8.36 ms | 0.93× | ~50% occupancy + per-tile barriers; still trails v1 |
+
+**Conclusion (honest).** The simplest kernel, v1, stays fastest — its 100% occupancy and
+embarrassingly-parallel simplicity beat the sophisticated tiled versions even after fixing
+their reduction overhead (v2), occupancy collapse (v3→v4), and bank conflicts (v4→v5). And
+**every hand-written version loses to cuBLAS (naive, 4.6 ms) and SDPA (1.1 ms).** At this
+model's scale (T=256, hs=64) beating those by hand is not realistic — they embody years of
+tuning. The deliverable here is the *journey*: a correct fused kernel built 5 ways, with each
+version's slowdown profiled and root-caused (reduction cost → occupancy → bank conflicts →
+barriers) — the real bottleneck hierarchy of GPU optimization. The production-grade win comes
+from using the right tool (swap the model's naive attention for SDPA) rather than out-coding NVIDIA.
 
 **v1 is correct but slow** — slower than both SDPA (FlashAttention) and the naive
 materialized path (which leans on cuBLAS bmm). Causes, in order of impact:

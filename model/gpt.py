@@ -23,6 +23,7 @@ class GPTConfig:
     n_head: int = 6
     n_embd: int = 384       # must be divisible by n_head
     dropout: float = 0.2
+    use_sdpa: bool = True   # True: fused F.scaled_dot_product_attention; False: naive materialized
 
 
 class Head(nn.Module):
@@ -68,6 +69,8 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
         self.n_head = cfg.n_head
+        self.use_sdpa = cfg.use_sdpa
+        self.dropout_p = cfg.dropout
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)  # Q, K, V in one matmul
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.attn_dropout = nn.Dropout(cfg.dropout)
@@ -83,11 +86,18 @@ class MultiHeadAttention(nn.Module):
         k = k.view(B, T, self.n_head, hs).transpose(1, 2)
         v = v.view(B, T, self.n_head, hs).transpose(1, 2)
 
-        wei = (q @ k.transpose(-2, -1)) * hs ** -0.5          # (B, nh, T, T), all heads at once
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.attn_dropout(wei)
-        out = wei @ v                                         # (B, nh, T, hs)
+        if self.use_sdpa:
+            # fused FlashAttention kernel: scale + causal mask + softmax + @V, one call
+            out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True,
+                dropout_p=self.dropout_p if self.training else 0.0)
+        else:
+            # naive materialized path (the (B, nh, T, T) matrix hits memory)
+            wei = (q @ k.transpose(-2, -1)) * hs ** -0.5      # (B, nh, T, T), all heads at once
+            wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+            wei = F.softmax(wei, dim=-1)
+            wei = self.attn_dropout(wei)
+            out = wei @ v                                     # (B, nh, T, hs)
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)  # reassemble heads -> (B, T, C)
         out = self.resid_dropout(self.proj(out))

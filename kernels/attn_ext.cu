@@ -1,63 +1,106 @@
-// Fused causal self-attention (mini-FlashAttention), v1: correct, not yet tuned.
+// Fused causal self-attention (mini-FlashAttention).
 //
-// Computes softmax(causal(Q Kᵀ / sqrt(hs))) V WITHOUT materializing the (T, T)
-// score matrix in global memory -- the whole point of fusion. It does this with
-// the FlashAttention "online softmax" recurrence: stream over keys keeping a
-// running max (m), running normalizer (l), and running output accumulator (acc),
-// rescaling acc/l whenever a bigger score appears.
-//
-// v1 layout: ONE THREAD per query row. Simplest correct expression of the
-// algorithm -- no shared memory, no tiling. Expected to be slower than SDPA;
-// this version exists to lock in correctness before optimizing.
+// Online-softmax recurrence; the (T,T) score matrix is never materialized.
+// Progression (numbers in benchmarks/kernels.md):
+//   v1: thread/row. Correct; acc[64] spills to local mem. ~100% occupancy. 7.78ms
+//   v2: warp/row, dims split across lanes -> a warp reduction PER KEY. Regressed.
+//   v3: warp/row, lane=key (efficient inner loop) but ONE WARP PER BLOCK -> ~6%
+//       occupancy (16KB shared/block starves the SM). Regressed hard (30ms).
+//   v4: QPB queries per block sharing ONE K/V tile. Restored occupancy (11ms) but
+//       the dot read Ktile[lane*HS+k] -> all 32 lanes hit one shared-memory bank
+//       (32-way conflict, serialized).
+//   v5 (ACTIVE): v4 + K stored TRANSPOSED in shared memory (Ktile[k*TILE+key]) so
+//       the dot's 32 lanes hit 32 distinct banks -> conflict-free reads.
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <float.h>
 
-#define HS 64   // head size (this model). asserted in the launcher.
+#define HS    64
+#define WARP  32
+#define TILE  32     // keys per shared tile
+#define QPB   8      // queries (= warps) per block; shares the K/V tile
 
-__global__ void attn_kernel(const float* Q, const float* K, const float* V,
-                            float* O, int B_nh, int T, float scale) {
-    long long r = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= (long long)B_nh * T) return;
-    int seq = r / T;            // which (batch, head) sequence
-    int i = r % T;              // this thread's query position
-    const float* q = Q + r * HS;
+__device__ __forceinline__ float warpMax(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+    return v;
+}
+__device__ __forceinline__ float warpSum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    return v;
+}
+
+__global__ void attn_kernel_v5(const float* Q, const float* K, const float* V,
+                               float* O, int B_nh, int T, float scale) {
+    int tid = threadIdx.x;
+    int w = tid / WARP;              // which query (warp) in this block
+    int lane = tid % WARP;
+    long long base_row = (long long)blockIdx.x * QPB;
+    long long row = base_row + w;    // this warp's query row
+    int seq = row / T;
+    int i = row % T;                 // this warp's causal limit
+
+    __shared__ float Ktile[TILE * HS];   // TRANSPOSED: [k][key] -> conflict-free dot reads
+    __shared__ float Vtile[TILE * HS];   // natural: [key][d]
+    __shared__ float qs[QPB * HS];       // each warp's query
+    __shared__ float ps[QPB * WARP];     // each warp's per-key weights
+
     const float* Kseq = K + (long long)seq * T * HS;
     const float* Vseq = V + (long long)seq * T * HS;
-    float* o = O + r * HS;
 
-    float qreg[HS];
-    #pragma unroll
-    for (int d = 0; d < HS; d++) qreg[d] = q[d];
+    qs[w * HS + lane] = Q[row * HS + lane];
+    qs[w * HS + lane + WARP] = Q[row * HS + lane + WARP];
+    __syncthreads();
 
-    float m = -FLT_MAX, l = 0.0f, acc[HS];
-    #pragma unroll
-    for (int d = 0; d < HS; d++) acc[d] = 0.0f;
+    float m = -FLT_MAX, l = 0.0f, acc0 = 0.0f, acc1 = 0.0f;
+    int max_i = (int)((base_row + QPB - 1) % T);   // block-wide last position
 
-    // stream over keys 0..i (causal: never look past the query position)
-    for (int j = 0; j <= i; j++) {
-        const float* kj = Kseq + (long long)j * HS;
-        float s = 0.0f;
-        #pragma unroll
-        for (int d = 0; d < HS; d++) s += qreg[d] * kj[d];
-        s *= scale;
+    for (int tile_start = 0; tile_start <= max_i; tile_start += TILE) {
+        // all 256 threads load the shared K/V tile once (reused by all QPB queries)
+        for (int idx = tid; idx < TILE * HS; idx += blockDim.x) {
+            // V natural layout [key][d]
+            int vgj = tile_start + idx / HS;
+            Vtile[idx] = (vgj < T) ? Vseq[(long long)vgj * HS + idx % HS] : 0.0f;
+            // K transposed layout [k][key]: Ktile[k*TILE + key] = K[key, k]
+            int kgj = tile_start + idx % TILE;
+            Ktile[idx] = (kgj < T) ? Kseq[(long long)kgj * HS + idx / TILE] : 0.0f;
+        }
+        __syncthreads();
 
-        // online-softmax update
-        float new_m = fmaxf(m, s);
-        float corr = expf(m - new_m);     // rescale old running sums to the new max
-        float p = expf(s - new_m);        // weight of this key
-        l = l * corr + p;
-        const float* vj = Vseq + (long long)j * HS;
-        #pragma unroll
-        for (int d = 0; d < HS; d++) acc[d] = acc[d] * corr + p * vj[d];
-        m = new_m;
+        if (tile_start <= i) {                 // warp-uniform: this query has keys here
+            int gj = tile_start + lane;
+            float s = -FLT_MAX;
+            if (gj <= i) {
+                float d = 0.0f;
+                #pragma unroll
+                for (int k = 0; k < HS; k++) d += qs[w * HS + k] * Ktile[k * TILE + lane];
+                s = d * scale;
+            }
+            float new_m = fmaxf(m, warpMax(s));
+            float corr = expf(m - new_m);
+            float p = (s == -FLT_MAX) ? 0.0f : expf(s - new_m);
+            ps[w * WARP + lane] = p;
+            l = l * corr + warpSum(p);
+            __syncwarp();
+
+            float u0 = 0.0f, u1 = 0.0f;
+            #pragma unroll
+            for (int kk = 0; kk < TILE; kk++) {
+                float pk = ps[w * WARP + kk];
+                u0 += pk * Vtile[kk * HS + lane];
+                u1 += pk * Vtile[kk * HS + lane + WARP];
+            }
+            acc0 = acc0 * corr + u0;
+            acc1 = acc1 * corr + u1;
+            m = new_m;
+        }
+        __syncthreads();                       // before the next tile overwrites shared K/V
     }
 
     float inv = 1.0f / l;
-    #pragma unroll
-    for (int d = 0; d < HS; d++) o[d] = acc[d] * inv;
+    O[row * HS + lane] = acc0 * inv;
+    O[row * HS + lane + WARP] = acc1 * inv;
 }
 
 torch::Tensor attn_cuda(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
@@ -67,13 +110,13 @@ torch::Tensor attn_cuda(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
     auto Qc = Q.contiguous(), Kc = K.contiguous(), Vc = V.contiguous();
     int B = Qc.size(0), nh = Qc.size(1), T = Qc.size(2);
     int B_nh = B * nh;
+    TORCH_CHECK(((long long)B_nh * T) % QPB == 0 && T % QPB == 0,
+                "B*nh*T and T must be divisible by QPB");
     auto O = torch::empty_like(Qc);
 
     float scale = 1.0f / sqrtf((float)HS);
-    long long total = (long long)B_nh * T;       // one thread per query row
-    int threads = 256;
-    long long blocks = (total + threads - 1) / threads;
-    attn_kernel<<<blocks, threads>>>(
+    long long blocks = (long long)B_nh * T / QPB;
+    attn_kernel_v5<<<blocks, QPB * WARP>>>(
         Qc.data_ptr<float>(), Kc.data_ptr<float>(), Vc.data_ptr<float>(),
         O.data_ptr<float>(), B_nh, T, scale);
     return O;
