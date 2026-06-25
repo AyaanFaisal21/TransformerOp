@@ -52,7 +52,45 @@ All versions correct (max_err ~1e-6 vs SDPA).
 | v4 | v3 + 8 queries/block sharing K/V tile | 11.3 ms | 0.69× | 32-way shared-memory bank conflict in the dot |
 | v5 | v4 + K stored transposed (conflict-free) | 8.36 ms | 0.93× | ~50% occupancy + per-tile barriers; still trails v1 |
 
-**Conclusion (honest).** The simplest kernel, v1, stays fastest — its 100% occupancy and
+## KV cache (generation)
+
+Naive generate reprocesses the whole context every token (O(n²) compute); the cache
+stores each layer's K/V and computes only the new token (O(n)). Correctness verified:
+incremental cached logits == single full forward (max_err 5e-7). SDPA used in both
+paths for a fair comparison. (Caps at block_size; sliding-window eviction not implemented.)
+
+| regime | no cache | KV cache | speedup |
+|---|---|---|---|
+| real model (384d, 6L, ctx 256), gen 200 | 390 tok/s | 375 tok/s | **0.96× (par)** |
+| bigger (768d, 12L, ctx 512), gen 400 | 86 tok/s | 191 tok/s | **2.21×** |
+
+**The cache is a *compute* reduction, so it only helps when generation is compute-bound.**
+At our small scale generation is *overhead*-bound (200 sequential tiny launches dominate;
+the GPU absorbs the redundant compute for free) → no win. Scale the model/context up and
+compute dominates → 2.2×. This is why the KV cache is essential for production LLMs and
+invisible on a toy model — the same regime principle as the attention kernels below.
+
+## SDPA swap — end-to-end (Phase 4)
+
+Op-level (bench.py): SDPA is ~3.6× faster than naive attention *in isolation*. But the
+full **training step** (B=64, T=256, fp32):
+
+| attention path | train step | tok/s |
+|---|---|---|
+| naive materialized | 309 ms | 53,000 |
+| SDPA | 326 ms | 50,300 |
+
+**0.95× — no end-to-end win** (within noise / slightly slower). Two reasons: (1) attention
+is only ~10% of a training step (matmuls dominate, see profile.md), so a 3.6× on 10%
+barely moves the total; (2) fp32 on Turing (sm_75) doesn't hit the FlashAttention fast
+path — SDPA falls back to a math/mem-efficient backend, so there's little fusion gain and
+its backward isn't faster here. SDPA still wins on *memory* and at larger scale / fp16, so
+it's a fine default — but claiming it speeds up *this* model's training would be
+**ideological, not functional**: the op-level number doesn't survive end-to-end measurement.
+
+## Attention conclusion (honest)
+
+The simplest kernel, v1, stays fastest — its 100% occupancy and
 embarrassingly-parallel simplicity beat the sophisticated tiled versions even after fixing
 their reduction overhead (v2), occupancy collapse (v3→v4), and bank conflicts (v4→v5). And
 **every hand-written version loses to cuBLAS (naive, 4.6 ms) and SDPA (1.1 ms).** At this

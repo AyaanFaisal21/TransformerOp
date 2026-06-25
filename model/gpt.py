@@ -77,7 +77,7 @@ class MultiHeadAttention(nn.Module):
         self.resid_dropout = nn.Dropout(cfg.dropout)
         self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache=None, cache_pos: int = 0) -> torch.Tensor:
         B, T, C = x.shape
         hs = C // self.n_head
         q, k, v = self.qkv(x).split(C, dim=-1)                # each (B, T, C), one matmul
@@ -86,7 +86,17 @@ class MultiHeadAttention(nn.Module):
         k = k.view(B, T, self.n_head, hs).transpose(1, 2)
         v = v.view(B, T, self.n_head, hs).transpose(1, 2)
 
-        if self.use_sdpa:
+        if cache is not None:
+            # incremental decode: write this step's K/V into the cache, attend over all so far
+            ck, cv = cache                                    # preallocated (B, nh, block_size, hs)
+            ck[:, :, cache_pos:cache_pos + T] = k
+            cv[:, :, cache_pos:cache_pos + T] = v
+            k = ck[:, :, :cache_pos + T]                      # all keys seen so far
+            v = cv[:, :, :cache_pos + T]
+            # T==1 (decode step): the new query attends to ALL cached keys -> no mask.
+            # T>1 only happens priming the seed at cache_pos==0 -> standard causal.
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=(T > 1))
+        elif self.use_sdpa:
             # fused FlashAttention kernel: scale + causal mask + softmax + @V, one call
             out = F.scaled_dot_product_attention(
                 q, k, v, is_causal=True,
@@ -135,10 +145,10 @@ class Block(nn.Module):
         self.attn = MultiHeadAttention(cfg)
         self.ffwd = FeedForward(cfg)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache=None, cache_pos: int = 0) -> torch.Tensor:
         # the `x +` is the residual: each sub-layer proposes an *edit* to x
-        x = x + self.attn(self.ln1(x))   # communicate across positions
-        x = x + self.ffwd(self.ln2(x))   # then compute per position
+        x = x + self.attn(self.ln1(x), cache, cache_pos)   # communicate across positions
+        x = x + self.ffwd(self.ln2(x))                     # then compute per position
         return x
 
 
@@ -152,27 +162,50 @@ class GPT(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
+                kv_caches=None, cache_pos: int = 0):
         B, T = idx.shape
-        tok = self.token_emb(idx)                                  # (B, T, C)
-        pos = self.pos_emb(torch.arange(T, device=idx.device))     # (T, C), broadcast over B
+        tok = self.token_emb(idx)                                          # (B, T, C)
+        pos = self.pos_emb(torch.arange(cache_pos, cache_pos + T, device=idx.device))
         x = tok + pos
-        x = self.blocks(x)
+        for i, block in enumerate(self.blocks):
+            x = block(x, kv_caches[i] if kv_caches is not None else None, cache_pos)
         x = self.ln_f(x)
-        logits = self.lm_head(x)                                   # (B, T, vocab_size)
+        logits = self.lm_head(x)                                           # (B, T, vocab_size)
         if targets is None:
             return logits, None
         B, T, C = logits.shape
         loss = F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
         return logits, loss
 
+    def _empty_cache(self, B, device):
+        hs = self.cfg.n_embd // self.cfg.n_head
+        return [[torch.zeros(B, self.cfg.n_head, self.cfg.block_size, hs, device=device),
+                 torch.zeros(B, self.cfg.n_head, self.cfg.block_size, hs, device=device)]
+                for _ in range(self.cfg.n_layer)]
+
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, use_cache: bool = True) -> torch.Tensor:
+        if not use_cache:
+            # naive: re-run the full forward on the whole context every token
+            for _ in range(max_new_tokens):
+                idx_cond = idx[:, -self.cfg.block_size:]
+                logits, _ = self(idx_cond)
+                probs = F.softmax(logits[:, -1, :], dim=-1)
+                idx = torch.cat((idx, torch.multinomial(probs, num_samples=1)), dim=1)
+            return idx
+
+        # KV-cached: compute each new token once; attend over cached K/V
+        kv = self._empty_cache(idx.shape[0], idx.device)
+        seed = idx[:, -self.cfg.block_size:]
+        logits, _ = self(seed, kv_caches=kv, cache_pos=0)   # prime the cache with the seed
+        pos = seed.shape[1]
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.cfg.block_size:]   # crop: pos_emb has no rows past block_size
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, next_id), dim=1)
+            if pos >= self.cfg.block_size:
+                break   # cache full; sliding-window eviction not implemented (context limit)
+            logits, _ = self(next_id, kv_caches=kv, cache_pos=pos)
+            pos += 1
         return idx
