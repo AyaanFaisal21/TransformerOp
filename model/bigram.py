@@ -1,6 +1,6 @@
 """Bigram baseline: predict the next character from the current one alone.
 
-This is the dumbest possible language model -- a single embedding lookup where
+This is the dumbest possible language model (I love this little guy) -- a single embedding lookup where
 row i is the logit distribution over next-characters given character i. It
 exists to (a) get the data/train/sample plumbing working before attention
 enters the picture, and (b) establish the loss floor the transformer must

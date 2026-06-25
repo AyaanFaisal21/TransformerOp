@@ -2,7 +2,7 @@
 
 The explicit attention math here is the point: in Phase 3 these exact lines
 (matmul -> mask -> softmax -> matmul) are what get profiled and replaced with
-custom CUDA kernels. Keep them naive and readable.
+custom CUDA kernels. . . . Kept them naive and readable.
 
 Shape conventions used throughout:
   B = batch size, T = sequence length (<= block_size), C = n_embd, hs = head size
@@ -177,6 +177,11 @@ class Block(nn.Module):
         x = x + self.ffwd(self.ln2(x))                     # then compute per position
         return x
 
+    def decode_step(self, x, kc, vc, pos, key_pos):
+        x = x + self.attn.decode_step(self.ln1(x), kc, vc, pos, key_pos)
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
 
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
@@ -210,8 +215,56 @@ class GPT(nn.Module):
                  torch.zeros(B, self.cfg.n_head, self.cfg.block_size, hs, device=device)]
                 for _ in range(self.cfg.n_layer)]
 
+    def decode_step(self, tok_buf, pos_buf, kv, key_pos):
+        """One fixed-shape forward over a single token, for CUDA-graph capture."""
+        x = self.token_emb(tok_buf) + self.pos_emb(pos_buf)    # (B,1,C)
+        for i, block in enumerate(self.blocks):
+            x = block.decode_step(x, kv[i][0], kv[i][1], pos_buf, key_pos)
+        return self.lm_head(self.ln_f(x))[:, -1, :]            # (B, vocab)
+
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, use_cache: bool = True) -> torch.Tensor:
+    def _generate_graphed(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+        B, dev, bs = idx.shape[0], idx.device, self.cfg.block_size
+        kv = self._empty_cache(B, dev)
+        key_pos = torch.arange(bs, device=dev)
+        tok_buf = torch.zeros(B, 1, dtype=torch.long, device=dev)   # static input buffers...
+        pos_buf = torch.zeros(1, dtype=torch.long, device=dev)      # ...replay reads their current values
+
+        # warm up on a side stream (required before capture), then record one decode step.
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self.decode_step(tok_buf, pos_buf, kv, key_pos)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            static_logits = self.decode_step(tok_buf, pos_buf, kv, key_pos)
+        for kc, vc in kv:                       # warmup/capture wrote garbage into the cache
+            kc.zero_(); vc.zero_()
+
+        # prime the seed by replaying the graph (fills the cache at positions 0..len-1)
+        seed = idx[:, -bs:]
+        for t in range(seed.shape[1]):
+            tok_buf.copy_(seed[:, t:t + 1]); pos_buf.fill_(t)
+            g.replay()
+        pos = seed.shape[1]
+
+        # decode loop: one graph replay per token -- a single launch instead of hundreds
+        for _ in range(max_new_tokens):
+            next_id = torch.multinomial(F.softmax(static_logits, dim=-1), num_samples=1)
+            idx = torch.cat((idx, next_id), dim=1)
+            if pos >= bs:
+                break
+            tok_buf.copy_(next_id); pos_buf.fill_(pos)
+            g.replay()
+            pos += 1
+        return idx
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int,
+                 use_cache: bool = True, use_graph: bool = False) -> torch.Tensor:
+        if use_graph:
+            return self._generate_graphed(idx, max_new_tokens)
         if not use_cache:
             # naive: re-run the full forward on the whole context every token
             for _ in range(max_new_tokens):

@@ -15,7 +15,7 @@ attention, KV cache) are masked; the real wins came from changes that hit the
 - [x] **Phase 2 — Measure**: benchmark harness (warmup + `cuda.synchronize` + median), training-step profile, regression tests
 - [x] **Phase 3 — Custom CUDA kernels**: softmax ✅, fused causal attention (5 versions) ✅; *matmul ladder skipped* — its tiling / bank-conflict lessons were already covered inside the attention kernels, and a plain matmul only loses to cuBLAS
 - [x] **Phase 4 — Close the loop**: swap the attention path, measure the end-to-end training step
-- [x] **Phase 5 — Overhead minimization** (bonus): CUDA graphs vs eager across batch sizes
+- [x] **Phase 5 — Overhead minimization** (bonus): static KV cache + CUDA-graph decode → **4.2× faster generation**
 
 ## Results
 
@@ -39,7 +39,7 @@ is ≈1 bit/char; the GPT at 2.16 is close, the bigram isn't.) Output is Shakesp
 | Fused attention, v1–v5 from scratch | < cuBLAS / SDPA | ❌ honest loss at this scale |
 | KV cache | 0.96× (small) / **2.21×** (bigger model) | ⚪ regime-dependent |
 | SDPA swap, end-to-end | 0.95× | ⚪ op-level 3.6× didn't survive |
-| CUDA graphs (forward) | **1.63× @ B=1**, 1.16× @ B=64 | ✅ overhead win, shrinks with batch |
+| KV cache vs static cache + **CUDA-graph decode** | **4.2× generation** | ✅ biggest win — overhead fix on the overhead-bound path |
 
 **Three lessons the numbers taught:**
 1. **Regime decides.** Compute-reductions help only when compute is the bottleneck — here it isn't, so the KV cache and SDPA fusion barely moved the needle, while overhead fixes (batched heads, CUDA graphs) did.
@@ -62,8 +62,9 @@ py -3.10 -m venv .venv
 # measure
 .venv\Scripts\python -m pytest tests/ -q       # regression tests
 .venv\Scripts\python -m benchmarks.bench       # forward / train / generate + op timings
-.venv\Scripts\python -m benchmarks.kv_cache    # KV cache regime study
-.venv\Scripts\python -m benchmarks.overhead    # CUDA graph overhead study
+.venv\Scripts\python -m benchmarks.kv_cache       # KV cache regime study
+.venv\Scripts\python -m benchmarks.overhead       # CUDA graph overhead study (forward)
+.venv\Scripts\python -m benchmarks.graphed_decode # static cache + graphed decode (4.2x gen)
 
 # custom CUDA kernels (need CUDA Toolkit 12.x + MSVC; winbuild.bat sets up the env)
 cmd /c "kernels\winbuild.bat -m kernels.softmax"

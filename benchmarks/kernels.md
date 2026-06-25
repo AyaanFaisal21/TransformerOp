@@ -85,11 +85,27 @@ Forward, T=256, eager vs CUDA-graph replay (correct everywhere):
 | B=64 | 88.9 ms | 76.7 ms | 1.16× |
 
 **Confirms the regime:** the overhead fix helps most at B=1 (GPU starved, launches dominate)
-and shrinks as a bigger batch fills the machine with real work. This is *the* way to speed up
-small / batch-1 / decode workloads — and the right tool for our generation path (vs the KV
-cache, which cut compute that wasn't the bottleneck). Applying it to real decode needs a
-fixed-shape step (static KV cache padded to block_size) so each token's launch sequence is
-graph-capturable — the technique production fast-decoders use.
+and shrinks as a bigger batch fills the machine with real work.
+
+### Static cache + graphed decode — end-to-end generation (the real win)
+
+We then built the real thing: a STATIC KV cache padded to block_size so every decode step
+is a fixed shape, attention over the full cache (masking slots > pos), position passed as a
+tensor — so one decode step is graph-capturable and replayed per token. Generate 200 tokens
+(B=1), correct (max_err 4.8e-7):
+
+| path | tok/s | vs |
+|---|---|---|
+| no cache | 398 | — |
+| KV cache | 387 | 0.97× |
+| **static cache + CUDA graph** | **1664** | **4.2× vs no-cache, 4.3× vs KV** |
+
+**4.2× on real generation** — far bigger than the 1.63× forward proxy, because the decode
+loop pays per-token launch overhead 200×, and the graph collapses each token's hundreds of
+launches into one replay. Generation was overhead-bound; the KV cache (a *compute* fix) did
+nothing, the CUDA graph (an *overhead* fix) won big. Right tool for the measured bottleneck.
+Cost: static cache attends over the full block_size every step (minor) and caps at block_size
+(no sliding-window eviction). This is how production fast-decoders (gpt-fast, TensorRT-LLM) work.
 
 ## SDPA swap — end-to-end (Phase 4)
 
