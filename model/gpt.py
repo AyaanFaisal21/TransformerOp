@@ -113,6 +113,32 @@ class MultiHeadAttention(nn.Module):
         out = self.resid_dropout(self.proj(out))
         return out
 
+    def decode_step(self, x, kc, vc, pos, key_pos):
+        """One fixed-shape decode step, built for CUDA-graph capture.
+
+        x: (B,1,C). kc/vc: STATIC caches (B, nh, block_size, hs) preallocated to the full
+        context. pos: a (1,) long *tensor*; key_pos: arange(block_size).
+
+        Two decisions make this graph-capturable: (1) we always attend over the *full*
+        block_size (fixed shape every step, masking slots > pos), and (2) the position is
+        a tensor, not a Python int -- so the single recorded graph is valid at every step.
+        K/V are written with index_copy_ (a tensor index) instead of a Python slice.
+        """
+        B, _, C = x.shape
+        hs = C // self.n_head
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q = q.view(B, 1, self.n_head, hs).transpose(1, 2)
+        k = k.view(B, 1, self.n_head, hs).transpose(1, 2)
+        v = v.view(B, 1, self.n_head, hs).transpose(1, 2)
+        kc.index_copy_(2, pos, k)                            # write this token's K at `pos`
+        vc.index_copy_(2, pos, v)
+        att = (q @ kc.transpose(-2, -1)) * hs ** -0.5        # (B, nh, 1, block_size)
+        att = att.masked_fill(key_pos > pos, float("-inf"))  # keep only positions 0..pos
+        att = F.softmax(att, dim=-1)
+        out = att @ vc                                       # (B, nh, 1, hs)
+        out = out.transpose(1, 2).contiguous().view(B, 1, C)
+        return self.proj(out)
+
 
 class FeedForward(nn.Module):
     """Position-wise MLP: n_embd -> 4*n_embd -> GELU -> n_embd -> dropout."""

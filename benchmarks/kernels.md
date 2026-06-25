@@ -70,6 +70,27 @@ the GPU absorbs the redundant compute for free) → no win. Scale the model/cont
 compute dominates → 2.2×. This is why the KV cache is essential for production LLMs and
 invisible on a toy model — the same regime principle as the attention kernels below.
 
+## Overhead-targeted: CUDA Graphs (small-model optimization)
+
+A small model is *overhead*-bound, not compute-bound, so the lever is cutting launch/
+Python overhead, not FLOPs. `torch.compile` is unavailable here (needs Triton; not working
+on this Windows box). CUDA Graphs record a launch sequence once and replay it in one shot.
+
+Forward, T=256, eager vs CUDA-graph replay (correct everywhere):
+
+| batch | eager | graph | speedup |
+|---|---|---|---|
+| **B=1** (decode regime) | 3.05 ms | 1.87 ms | **1.63×** |
+| B=8 | 12.1 ms | 12.1 ms | 1.00× |
+| B=64 | 88.9 ms | 76.7 ms | 1.16× |
+
+**Confirms the regime:** the overhead fix helps most at B=1 (GPU starved, launches dominate)
+and shrinks as a bigger batch fills the machine with real work. This is *the* way to speed up
+small / batch-1 / decode workloads — and the right tool for our generation path (vs the KV
+cache, which cut compute that wasn't the bottleneck). Applying it to real decode needs a
+fixed-shape step (static KV cache padded to block_size) so each token's launch sequence is
+graph-capturable — the technique production fast-decoders use.
+
 ## SDPA swap — end-to-end (Phase 4)
 
 Op-level (bench.py): SDPA is ~3.6× faster than naive attention *in isolation*. But the

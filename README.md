@@ -1,86 +1,84 @@
 # TransformerOp
 
-Train a small GPT from scratch, then make it fast: profile the training loop, hand-write CUDA kernels for the hot paths, and benchmark them honestly against stock PyTorch ops.
+A GPT built from scratch (tokenizer → attention → training loop), then a **measured**
+optimization study: profile it, hand-write CUDA kernels, and benchmark every change
+honestly against PyTorch — keeping only the wins that survive *end-to-end*.
 
-Two phases, each justifying the other: the from-scratch model is the *real workload* the kernels are measured against — not synthetic shapes.
+**Headline finding:** at a small model's scale the bottleneck is *overhead* (kernel
+launches, occupancy), not *compute* (FLOPs). Textbook compute-reductions (fused
+attention, KV cache) are masked; the real wins came from changes that hit the
+*measured* bottleneck (batching heads, CUDA graphs).
 
 ## Roadmap
 
-### Phase 1 — Model from scratch (PyTorch, no `nn.Transformer`) ✅
-- [x] Char-level tokenizer
-- [x] Bigram baseline (establishes the loss floor to beat)
-- [x] Single-head causal self-attention
-- [x] Multi-head attention + feedforward + residual blocks → full GPT
-- [x] Training loop with train/val eval, checkpointing, loss curves
-- [x] Generated samples in this README
-
-### Phase 2 — Measure
-- [ ] Profile one training step (PyTorch profiler → Nsight Systems/Compute)
-- [ ] Document where step time actually goes (`benchmarks/profile.md`)
-
-### Phase 3 — Custom CUDA kernels (compiled as PyTorch C++ extensions)
-- [ ] Softmax (warp shuffles, online normalization)
-- [ ] Matmul progression: naive → shared-memory tiling → vectorized loads, benchmarked at each step
-- [ ] Fused causal attention (mini-FlashAttention)
-- [ ] Each kernel: benchmark table vs. the `torch` equivalent **at this model's actual shapes** — including the cases where the stock op wins
-
-### Phase 4 — Close the loop
-- [ ] Swap custom kernels into the training run
-- [ ] End-to-end step time, before vs. after
+- [x] **Phase 1 — Model from scratch** (no `nn.Transformer`): tokenizer, bigram baseline, multi-head attention, GPT, training loop, samples
+- [x] **Phase 2 — Measure**: benchmark harness (warmup + `cuda.synchronize` + median), training-step profile, regression tests
+- [x] **Phase 3 — Custom CUDA kernels**: softmax ✅, fused causal attention (5 versions) ✅; *matmul ladder skipped* — its tiling / bank-conflict lessons were already covered inside the attention kernels, and a plain matmul only loses to cuBLAS
+- [x] **Phase 4 — Close the loop**: swap the attention path, measure the end-to-end training step
+- [x] **Phase 5 — Overhead minimization** (bonus): CUDA graphs vs eager across batch sizes
 
 ## Results
 
-### Phase 1 — model quality
+**Model quality** — Tiny Shakespeare, 5000 iters, B=64 × T=256:
 
-Trained on Tiny Shakespeare (1.0M train / 0.11M val characters, vocab 65), 5000 iters, batch 64 × block 256, AdamW.
+| Model | Params | Val loss | Bits/char |
+|---|---|---|---|
+| Bigram baseline | 4.2K | 2.49 | 3.59 |
+| **GPT** (6L, 6H, 384d) | 10.8M | **1.50** | **2.16** |
 
-| Model | Params | Val loss | Bits/char | What it captures |
-|---|---|---|---|---|
-| Bigram baseline | 4,225 | 2.49 | 3.59 | adjacent character pairs only |
-| **GPT** (6 layer, 6 head, 384 dim) | 10.8M | **1.50** | **2.16** | spelling, names, dialogue structure |
+The 2.49 → 1.50 gap is the measured value of attention. (Shannon's estimate for English
+is ≈1 bit/char; the GPT at 2.16 is close, the bigram isn't.) Output is Shakespearean in
+*form*, not meaning — expected at this scale.
 
-The 2.49 → 1.50 gap is the measured value of attention over a one-character-context model. For reference, Shannon's estimate of the entropy of English is ~1 bit/char — the GPT (2.16) is in the right neighborhood; the bigram is not.
+**Optimization scorecard** — full detail in [`benchmarks/kernels.md`](benchmarks/kernels.md):
 
-**Honesty notes.** The GPT learns *form*, not *meaning* — output is orthographically and structurally Shakespearean but semantically incoherent (expected at 10M params on 1MB of text). Training shows mild overfitting: val loss bottomed at ~1.478 near iter 3500, then drifted up to 1.50 by iter 5000 while train loss kept falling to 0.997 (early stopping ~3500 would help).
+| Change | Measured | Verdict |
+|---|---|---|
+| Batch attention heads (PyTorch) | gen **4.7×**, train 1.12× | ✅ functional win |
+| Custom softmax kernel | = torch at the attention shape | ✅ matched (learning) |
+| Fused attention, v1–v5 from scratch | < cuBLAS / SDPA | ❌ honest loss at this scale |
+| KV cache | 0.96× (small) / **2.21×** (bigger model) | ⚪ regime-dependent |
+| SDPA swap, end-to-end | 0.95× | ⚪ op-level 3.6× didn't survive |
+| CUDA graphs (forward) | **1.63× @ B=1**, 1.16× @ B=64 | ✅ overhead win, shrinks with batch |
 
-Sample (GPT, 500 tokens, untrimmed):
+**Three lessons the numbers taught:**
+1. **Regime decides.** Compute-reductions help only when compute is the bottleneck — here it isn't, so the KV cache and SDPA fusion barely moved the needle, while overhead fixes (batched heads, CUDA graphs) did.
+2. **cuBLAS/SDPA are unbeatable by hand at this scale.** The value was learning the bottleneck hierarchy — reduction cost → occupancy → bank conflicts — measured at every rung of the 5-version attention kernel.
+3. **Believe only end-to-end measurements.** SDPA was 3.6× faster on the attention *op* but 0.95× on the full training *step* (attention is only ~10% of it). An op-level win that doesn't survive is ideology, not optimization.
 
+## Run
+
+```powershell
+# setup
+py -3.10 -m venv .venv
+.venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu126
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python data\get_data.py
+
+# train + sample
+.venv\Scripts\python train.py --model gpt
+.venv\Scripts\python sample.py --model gpt --tokens 500
+
+# measure
+.venv\Scripts\python -m pytest tests/ -q       # regression tests
+.venv\Scripts\python -m benchmarks.bench       # forward / train / generate + op timings
+.venv\Scripts\python -m benchmarks.kv_cache    # KV cache regime study
+.venv\Scripts\python -m benchmarks.overhead    # CUDA graph overhead study
+
+# custom CUDA kernels (need CUDA Toolkit 12.x + MSVC; winbuild.bat sets up the env)
+cmd /c "kernels\winbuild.bat -m kernels.softmax"
+cmd /c "kernels\winbuild.bat -m kernels.attention"
 ```
-DUKE VINCENTIO:
-Base name, good Catesby; as I am hurry
-Surprised under him.
-
-ISABELLA:
-He would have a foul time to do it.
-```
-
-### Phase 2+ — performance
-
-Pre-optimization training throughput: **~15,000 tok/s** on an RTX 2060 SUPER (crude in-loop timing; Phase 2 re-measures with warmup + `cuda.synchronize`). This is the baseline the custom kernels are measured against.
 
 ## Layout
 
 ```
-data/        dataset download + prepared binaries
-model/       tokenizer, bigram baseline, GPT
-kernels/     CUDA C++ kernels + extension bindings (Phase 3)
-benchmarks/  profiles and benchmark tables (Phases 2–4)
-train.py     training entry point
-sample.py    generate text from a checkpoint
+model/       tokenizer, bigram, GPT
+kernels/     CUDA C++ kernels + extension build (winbuild.bat)
+benchmarks/  profile.md, kernels.md + the benchmark scripts
+train.py / sample.py
 ```
-
-## Setup
-
-```powershell
-py -3.10 -m venv .venv
-.venv\Scripts\python -m pip install --upgrade pip
-.venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu126
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python data\get_data.py
-```
-
-Phase 3 additionally requires the CUDA Toolkit 12.x (`nvcc`) and MSVC (Visual Studio Build Tools, C++ workload).
 
 ## Hardware
 
-NVIDIA RTX 2060 SUPER (8 GB, Turing sm_75), Windows 10. All benchmarks in this repo were run on this card.
+RTX 2060 SUPER (8 GB, Turing sm_75), Windows 10, torch 2.12 + CUDA 12.6. All numbers from this card.
