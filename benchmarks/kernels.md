@@ -35,6 +35,28 @@ sweep. Irrelevant for our fixed workload (T=256, firmly in the warp regime).
 which transfers directly to the fused-attention kernel, where fusion lets a custom
 kernel do what calling separate torch ops cannot.
 
+## Fused causal attention (`kernels/attn_ext.cu`)
+
+`softmax(causal(QKᵀ/√hs)) V` without materializing the (T,T) score matrix, via the
+FlashAttention online-softmax recurrence (running max + running sum + rescaled
+accumulator). Shape B=64, nh=6, T=256, hs=64. Correctness vs `F.scaled_dot_product_attention`.
+
+| version | design | correctness | time | vs SDPA | vs naive |
+|---|---|---|---|---|---|
+| v1 | one thread per query row | allclose, max_err 8.3e-7 | 7.78 ms | 0.14× | 0.44× |
+
+**v1 is correct but slow** — slower than both SDPA (FlashAttention) and the naive
+materialized path (which leans on cuBLAS bmm). Causes, in order of impact:
+1. one thread per row → no intra-row parallelism; each thread serially walks up to
+   T keys doing 64-dim dot products.
+2. `acc[64]` per thread spills to local memory → heavy local-memory traffic.
+3. no shared-memory tiling → K/V reread from global memory every row.
+4. causal load imbalance across warps (row 0 does 1 key, row 255 does 256).
+
+Optimization runway (real FlashAttention): warp/block per query tile, shared-memory
+K/V tiles reused across queries, accumulator in registers across warp lanes,
+coalesced loads. Matching SDPA is the hard part; v1 establishes correctness first.
+
 **Honest takeaway:** we *match*, not beat, torch's tuned softmax on the target shape —
 expected (it's already a good fused kernel). The real value here is the warp-shuffle +
 stable-softmax craft, which transfers directly to the fused-attention kernel, where
